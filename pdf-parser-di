@@ -1,0 +1,112 @@
+import io
+import json
+import os
+import dotenv
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.core.credentials import AzureKeyCredential
+from azure.storage.blob import BlobServiceClient
+from pypdf import PdfReader
+
+dotenv.load_dotenv()
+# -------------------------
+# CONFIG
+# -------------------------
+DI_ENDPOINT = "https://congilaw-pdfparser.cognitiveservices.azure.com/"
+DI_KEY = "1tYYhDzLajBOmbyQ80gH0v5JzCvayXwWD1r1bdgH7gF7pcOXP6N7JQQJ99CAACL93NaXJ3w3AAALACOGMFRz"
+
+STORAGE_CONN_STRING = os.getenv("STORAGE_CONN_STRING")
+RAW_CONTAINER = "raw"
+PARSED_CONTAINER = "parsed"
+
+# -------------------------
+# CLIENTS
+# -------------------------
+doc_client = DocumentIntelligenceClient(
+    endpoint=DI_ENDPOINT,
+    credential=AzureKeyCredential(DI_KEY)
+)
+
+blob_service = BlobServiceClient.from_connection_string(STORAGE_CONN_STRING)
+raw_container = blob_service.get_container_client(RAW_CONTAINER)
+parsed_container = blob_service.get_container_client(PARSED_CONTAINER)
+
+# -------------------------
+# PARSER FUNCTION
+# -------------------------
+def parse_pdf_bytes(pdf_bytes: bytes) -> dict:
+    """
+    Takes raw PDF bytes and returns structured page-level text.
+    """
+
+    
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    print("downloaded bytes:", len(pdf_bytes), "pages:", len(reader.pages))
+
+    poller = doc_client.begin_analyze_document(
+        model_id="prebuilt-layout",
+        body=io.BytesIO(pdf_bytes)
+    )
+
+    result = poller.result()
+
+    pages = []
+
+    for page in result.pages:
+        lines = []
+
+        # Lines are already in reading order
+        for line in page.lines:
+            text = line.content.strip()
+            if text:
+                lines.append(text)
+
+        page_text = " ".join(lines)
+
+        pages.append({
+            "page_number": page.page_number,
+            "text": page_text
+        })
+
+    return {
+        "num_pages": len(pages),
+        "pages": pages
+    }
+
+# -------------------------
+# PIPELINE
+# -------------------------
+def run():
+    for blob in raw_container.list_blobs():
+        if not blob.name.lower().endswith(".pdf"):
+            continue
+
+        print(f"Parsing: {blob.name}")
+
+        parsed_name = blob.name.replace(".pdf", ".json")
+
+        # Guard: skip if already parsed
+        if parsed_container.get_blob_client(parsed_name).exists():
+            print("  → already parsed, skipping")
+            continue
+
+        # Download PDF
+        pdf_blob = raw_container.get_blob_client(blob.name)
+        pdf_bytes = pdf_blob.download_blob().readall()
+
+        # Parse
+        parsed_doc = parse_pdf_bytes(pdf_bytes)
+
+        parsed_doc["source_document"] = blob.name
+
+        # Upload parsed JSON
+        parsed_container.upload_blob(
+            name=parsed_name,
+            data=json.dumps(parsed_doc, ensure_ascii=False, indent=2),
+            overwrite=True,
+            content_type="application/json"
+        )
+
+        print("  → parsed successfully")
+
+if __name__ == "__main__":
+    run()
