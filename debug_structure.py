@@ -1,303 +1,248 @@
 import re
 import json
-from typing import List, Dict, Optional
 from azure.storage.blob import BlobServiceClient
 import os
 import dotenv
 
 dotenv.load_dotenv()
 
-# -------------------------
-# CONFIG
-# -------------------------
 STORAGE_CONN_STRING = os.getenv("STORAGE_CONN_STRING")
-PARSED_CONTAINER = "parsed"
-CHUNKS_CONTAINER = "chunks"
-
 blob_service = BlobServiceClient.from_connection_string(STORAGE_CONN_STRING)
-parsed_container = blob_service.get_container_client(PARSED_CONTAINER)
-chunks_container = blob_service.get_container_client(CHUNKS_CONTAINER)
+parsed_container = blob_service.get_container_client("parsed")
+chunks_container = blob_service.get_container_client("chunks")
 
-# -------------------------
-# STRUCTURE DETECTOR
-# -------------------------
-class StructureDetector:
-    # More flexible patterns
-    CHAPTER = re.compile(
-        r'(?:^|\s)Chapter\s+([IVXLC\d]+[A-Z]?)[\s.:—-]*(.+)?',
-        re.IGNORECASE | re.MULTILINE
-    )
-    PART = re.compile(
-        r'(?:^|\s)Part\s+([IVXLC\d]+[A-Z]?)[\s.:—-]*(.+)?',
-        re.IGNORECASE | re.MULTILINE
-    )
-    DIVISION = re.compile(
-        r'(?:^|\s)Division\s+(\d+[A-Z]?)[\s.:—-]*(.+)?',
-        re.IGNORECASE | re.MULTILINE
-    )
+# ================================================================
+# DOCUMENT CONFIGS
+# ================================================================
+
+CONFIGS = {
+    "constitution": {
+        "section": r'^(\d+)\.\s{1,3}([A-Z][A-Za-z\s]{3,80})\.$',
+        "chapter": r'Chapter\s+([IVXLC]+)[:\s.-]+([A-Z][^.\n]{10,80}?)\.',
+        "part": r'Part\s+([IVXLC]+)[:\s.-]+([A-Z][^.\n]{10,80}?)\.',
+    },
+    "criminal_code_1899": {
+        "section": r'^(\d+[A-Z]?)\s+([A-Z][a-z]{3,}(?:\s+[a-z]+){0,15})(?=\s+[A-Z(])',
+        "chapter": r'Chapter\s+(\d+[A-Z]?)[:\s.-]+([A-Z][a-zA-Z\s]{10,80}?)(?=\s+\d{1,4}|\.|$)',
+        "part": r'Part\s+(\d+[A-Z]?)[:\s.-]+([A-Z][a-zA-Z\s]{10,80}?)(?=\s+\d{1,4}|\.|$)',
+        "division": r'Division\s+(\d+)[:\s.-]+([A-Z][a-zA-Z\s]{10,80}?)(?=\s+\d{1,4}|\.|$)',
+    },
+    "criminal_code_1995": {
+        "section": r'^(\d+\.\d+)\s+([A-Z][a-z]{3,}(?:\s+[a-z]+){0,15})',
+        "chapter": r'Chapter\s+(\d+)[:\s.-]+([A-Z][^.\n]{10,150})',
+        "part": r'Part\s+(\d+\.\d+)[:\s.-]+([A-Z][^.\n]{10,150})',
+    }
+}
+
+def detect_doc_type(filename):
+    """Detect config from filename."""
+    fn = filename.lower()
+    if "constitution" in fn:
+        return "constitution"
+    elif "1899" in fn:
+        return "criminal_code_1899"
+    elif "1995" in fn:
+        return "criminal_code_1995"
+    return None
+
+def is_toc_page(text):
+    """Skip TOC pages (8+ lines ending with page numbers)."""
+    toc_lines = re.findall(r'^.{20,}\s+\d{1,3}$', text, re.MULTILINE)
+    return len(toc_lines) >= 8 or bool(re.search(r'compilation date|registered:', text, re.I))
+
+# ================================================================
+# CHUNKER
+# ================================================================
+
+def chunk_document(parsed_doc, config):
+    """Chunk using config patterns."""
+    patterns = {k: re.compile(v, re.MULTILINE | re.IGNORECASE) for k, v in config.items()}
     
-    # Section: "354 Kidnapping" or "354A Kidnapping for ransom"
-    # Must start at beginning of line/string
-    SECTION_HEADER = re.compile(
-        r'^(\d+[A-Z]?)\s+([A-Z][A-Za-z\s,\-()]{3,120})(?:\s|$)',
-        re.MULTILINE
-    )
+    chunks = []
+    context = {"chapter": None, "part": None, "division": None}
+    current_section = None
+    buffer = []
     
-    SUBSECTION = re.compile(r'^\s*\(([0-9a-z]+)\)', re.MULTILINE)
-
-    @classmethod
-    def detect(cls, text: str):
-        text = text.strip()
-        if not text:
-            return "text", None
-
-        # Check in order of specificity
-        if m := cls.CHAPTER.search(text):
-            return "chapter", {
-                "number": m.group(1).strip(),
-                "title": (m.group(2) or "").strip()
-            }
-
-        if m := cls.PART.search(text):
-            return "part", {
-                "number": m.group(1).strip(),
-                "title": (m.group(2) or "").strip()
-            }
-
-        if m := cls.DIVISION.search(text):
-            return "division", {
-                "number": m.group(1).strip(),
-                "title": (m.group(2) or "").strip()
-            }
-
-        if m := cls.SECTION_HEADER.match(text):
-            return "section", {
-                "number": m.group(1).strip(),
-                "title": m.group(2).strip()
-            }
-
-        if m := cls.SUBSECTION.match(text):
-            return "subsection", {"number": m.group(1)}
-
-        return "text", None
-
-
-# -------------------------
-# IMPROVED CHUNKER
-# -------------------------
-class LegalChunker:
-    def __init__(self):
-        self.detector = StructureDetector()
-
-    def chunk(self, parsed_doc: dict) -> List[Dict]:
-        chunks = []
-
-        current_chapter = None
-        current_part = None
-        current_division = None
-        current_section = None
-        buffer = []
-
-        for page in parsed_doc["pages"]:
-            page_num = page["page_number"]
-            lines = self._split_text(page["text"])
-
-            for line in lines:
-                kind, meta = self.detector.detect(line)
-
-                if kind == "chapter":
-                    # Flush previous section
-                    if current_section:
-                        chunks.append(
-                            self._create_chunk(
-                                current_section, buffer,
-                                current_chapter, current_part, current_division
-                            )
-                        )
-                        buffer = []
-                        current_section = None
-                    
-                    current_chapter = meta
-                    current_part = None
-                    current_division = None
-
-                elif kind == "part":
-                    if current_section:
-                        chunks.append(
-                            self._create_chunk(
-                                current_section, buffer,
-                                current_chapter, current_part, current_division
-                            )
-                        )
-                        buffer = []
-                        current_section = None
-                    
-                    current_part = meta
-                    current_division = None
-
-                elif kind == "division":
-                    if current_section:
-                        chunks.append(
-                            self._create_chunk(
-                                current_section, buffer,
-                                current_chapter, current_part, current_division
-                            )
-                        )
-                        buffer = []
-                        current_section = None
-                    
-                    current_division = meta
-
-                elif kind == "section":
-                    # Flush previous section
-                    if current_section:
-                        chunks.append(
-                            self._create_chunk(
-                                current_section, buffer,
-                                current_chapter, current_part, current_division
-                            )
-                        )
-                        buffer = []
-
-                    # Start new section
-                    current_section = {
-                        **meta,
-                        "page_start": page_num
-                    }
-                    buffer.append(line)
-
-                else:
-                    # Regular text or subsection
-                    if current_section:
-                        buffer.append(line)
-
-        # Flush final section
-        if current_section and buffer:
-            chunks.append(
-                self._create_chunk(
-                    current_section, buffer,
-                    current_chapter, current_part, current_division
-                )
-            )
-
-        return chunks
-
-    def _split_text(self, text: str) -> List[str]:
-        """
-        Split text into processable chunks.
-        Try multiple strategies.
-        """
-        # Strategy 1: If text has newlines, use them
-        if '\n' in text:
-            lines = [line.strip() for line in text.split('\n') if line.strip()]
-            if lines:
-                return lines
+    for page in parsed_doc["pages"]:
+        page_text = page["text"]
         
-        # Strategy 2: Split on sentence boundaries before capitals or parens
-        lines = re.split(r'(?<=[.;:])\s+(?=[A-Z(0-9])', text)
-        return [line.strip() for line in lines if line.strip()]
-
-    def _create_chunk(
-        self,
-        section: dict,
-        buffer: List[str],
-        chapter: Optional[dict],
-        part: Optional[dict],
-        division: Optional[dict],
-    ) -> dict:
-        """Create chunk with metadata."""
+        if is_toc_page(page_text):
+            continue
         
-        breadcrumb = []
-        if chapter and chapter.get('number'):
-            title = f"Chapter {chapter['number']}"
-            if chapter.get('title'):
-                title += f": {chapter['title']}"
-            breadcrumb.append(title)
+        # Split into lines - handle both newlines and sentence splits
+        if '\n' in page_text:
+            lines = [l.strip() for l in page_text.split('\n') if l.strip()]
+        else:
+            # No newlines - split on sentence boundaries
+            lines = [l.strip() for l in re.split(r'(?<=[.?!])\s+(?=[A-Z0-9(])', page_text) if l.strip()]
+        
+        for line in lines:
+            # Detect structure
+            struct_type = None
+            meta = None
             
-        if part and part.get('number'):
-            title = f"Part {part['number']}"
-            if part.get('title'):
-                title += f": {part['title']}"
-            breadcrumb.append(title)
-            
-        if division and division.get('number'):
-            title = f"Division {division['number']}"
-            if division.get('title'):
-                title += f": {division['title']}"
-            breadcrumb.append(title)
+            for stype in ["chapter", "part", "division", "section"]:
+                if stype not in patterns:
+                    continue
+                
+                m = patterns[stype].match(line) if stype == "section" else patterns[stype].search(line)
+                if m:
+                    title = m.group(2).strip() if len(m.groups()) > 1 else ""
+                    title = re.sub(r'\s+\d{1,4}\s*
 
-        return {
-            "chunk_id": f"section_{section['number']}",
-            "section_number": section["number"],
-            "section_title": section["title"],
-            "breadcrumb": " > ".join(breadcrumb) if breadcrumb else "",
-            "text": " ".join(buffer),
-            "metadata": {
-                "page_start": section.get("page_start"),
-                "chapter": chapter.get("number") if chapter else None,
-                "part": part.get("number") if part else None,
-                "division": division.get("number") if division else None,
-                "jurisdiction": "Queensland",
-                "document_type": "legislation"
-            }
+def make_chunk(section, buffer, context):
+    """Create chunk with breadcrumb."""
+    breadcrumb = []
+    for k in ["chapter", "part", "division"]:
+        if context.get(k):
+            breadcrumb.append(f"{k.title()} {context[k]['number']}: {context[k]['title']}")
+    
+    return {
+        "chunk_id": f"section_{section['number']}",
+        "section_number": section["number"],
+        "section_title": section["title"],
+        "breadcrumb": " > ".join(breadcrumb),
+        "text": " ".join(buffer),
+        "metadata": {
+            "page": section["page"],
+            **{k: context[k]["number"] if context.get(k) else None for k in ["chapter", "part", "division"]}
         }
+    }
 
+# ================================================================
+# MAIN
+# ================================================================
 
-# -------------------------
-# PIPELINE
-# -------------------------
-def run_chunking(test_mode=False):
-    """Process parsed documents and create chunks."""
-    
-    chunker = LegalChunker()
-    
+def run(test_mode=False):
     for blob in parsed_container.list_blobs():
         if not blob.name.endswith(".json"):
             continue
         
-        print(f"\n📄 Processing: {blob.name}")
+        print(f"\n📄 {blob.name}")
         
-        # Download parsed JSON
-        parsed_blob = parsed_container.get_blob_client(blob.name)
-        parsed_data = json.loads(parsed_blob.download_blob().readall())
+        doc_type = detect_doc_type(blob.name)
+        if not doc_type:
+            print("   ❌ Unknown type")
+            continue
         
-        # Create chunks
-        chunks = chunker.chunk(parsed_data)
+        print(f"   📋 Type: {doc_type}")
         
-        print(f"   ✅ Created {len(chunks)} chunks")
+        config = CONFIGS[doc_type]
+        parsed = json.loads(parsed_container.get_blob_client(blob.name).download_blob().readall())
+        
+        # Debug: count pages
+        total_pages = len(parsed["pages"])
+        skipped = sum(1 for p in parsed["pages"] if is_toc_page(p["text"]))
+        print(f"   📊 Pages: {total_pages} total, {skipped} skipped")
+        
+        chunks = chunk_document(parsed, config)
+        
+        print(f"   ✅ {len(chunks)} chunks")
         
         if test_mode and chunks:
-            print("\n   First 3 chunks:")
-            for i, chunk in enumerate(chunks[:3], 1):
-                print(f"\n   [{i}] Section {chunk['section_number']}: {chunk['section_title']}")
-                print(f"       Breadcrumb: {chunk['breadcrumb']}")
-                print(f"       Text preview: {chunk['text'][:100]}...")
+            for i, c in enumerate(chunks[:3], 1):
+                print(f"\n   [{i}] {c['section_number']}: {c['section_title']}")
+                if c['breadcrumb']:
+                    print(f"       📍 {c['breadcrumb']}")
+                print(f"       📝 {c['text'][:100]}...")
         
         if not test_mode:
-            # Save to chunks container
-            chunk_name = blob.name
-            chunks_doc = {
-                "source_document": parsed_data.get("source_document"),
-                "total_chunks": len(chunks),
-                "chunks": chunks
-            }
-            
             chunks_container.upload_blob(
-                name=chunk_name,
-                data=json.dumps(chunks_doc, ensure_ascii=False, indent=2),
-                overwrite=True,
-                content_type="application/json"
+                name=blob.name,
+                data=json.dumps({"source": blob.name, "total": len(chunks), "chunks": chunks}, indent=2),
+                overwrite=True
             )
-            print(f"   💾 Saved to {CHUNKS_CONTAINER}/{chunk_name}")
-
 
 if __name__ == "__main__":
     import sys
+    run(test_mode="--test" in sys.argv)
+, '', title)  # Clean trailing numbers
+                    struct_type = stype
+                    meta = {"number": m.group(1), "title": title}
+                    break
+            
+            # Handle structure
+            if struct_type in ["chapter", "part", "division"]:
+                if current_section:
+                    chunks.append(make_chunk(current_section, buffer, context))
+                    buffer = []
+                    current_section = None
+                context[struct_type] = meta
+                if struct_type == "chapter":
+                    context["part"] = context["division"] = None
+                elif struct_type == "part":
+                    context["division"] = None
+            
+            elif struct_type == "section":
+                if current_section:
+                    chunks.append(make_chunk(current_section, buffer, context))
+                    buffer = []
+                current_section = {**meta, "page": page["page_number"]}
+                buffer.append(line)
+            
+            elif current_section:
+                buffer.append(line)
     
-    # Run in test mode if --test flag provided
-    test_mode = "--test" in sys.argv
+    if current_section:
+        chunks.append(make_chunk(current_section, buffer, context))
     
-    if test_mode:
-        print("🧪 RUNNING IN TEST MODE (no saves)\n")
+    return chunks
+
+def make_chunk(section, buffer, context):
+    """Create chunk with breadcrumb."""
+    breadcrumb = []
+    for k in ["chapter", "part", "division"]:
+        if context.get(k):
+            breadcrumb.append(f"{k.title()} {context[k]['number']}: {context[k]['title']}")
     
-    run_chunking(test_mode=test_mode)
+    return {
+        "chunk_id": f"section_{section['number']}",
+        "section_number": section["number"],
+        "section_title": section["title"],
+        "breadcrumb": " > ".join(breadcrumb),
+        "text": " ".join(buffer),
+        "metadata": {
+            "page": section["page"],
+            **{k: context[k]["number"] if context.get(k) else None for k in ["chapter", "part", "division"]}
+        }
+    }
+
+# ================================================================
+# MAIN
+# ================================================================
+
+def run(test_mode=False):
+    for blob in parsed_container.list_blobs():
+        if not blob.name.endswith(".json"):
+            continue
+        
+        print(f"\n📄 {blob.name}")
+        
+        doc_type = detect_doc_type(blob.name)
+        if not doc_type:
+            print("   ❌ Unknown type")
+            continue
+        
+        config = CONFIGS[doc_type]
+        parsed = json.loads(parsed_container.get_blob_client(blob.name).download_blob().readall())
+        chunks = chunk_document(parsed, config)
+        
+        print(f"   ✅ {len(chunks)} chunks")
+        
+        if test_mode and chunks:
+            for i, c in enumerate(chunks[:3], 1):
+                print(f"\n   [{i}] {c['section_number']}: {c['section_title']}")
+                if c['breadcrumb']:
+                    print(f"       📍 {c['breadcrumb']}")
+                print(f"       📝 {c['text'][:100]}...")
+        
+        if not test_mode:
+            chunks_container.upload_blob(
+                name=blob.name,
+                data=json.dumps({"source": blob.name, "total": len(chunks), "chunks": chunks}, indent=2),
+                overwrite=True
+            )
+
+if __name__ == "__main__":
+    import sys
+    run(test_mode="--test" in sys.argv)
