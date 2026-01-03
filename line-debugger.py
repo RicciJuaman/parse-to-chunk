@@ -6,7 +6,7 @@ import dotenv
 
 dotenv.load_dotenv()
 
-STORAGE_CONN_STRING ="DefaultEndpointsProtocol=https;AccountName=cognilaw;AccountKey=9DAFdP2hUiMN1AAtPlnoM9lg1bOkQzlwhIj4heWvmU+S83uEiYUpyMPmStCJ9o3LOT4JWINuYiMl+AStm85MfQ==;EndpointSuffix=core.windows.net"
+STORAGE_CONN_STRING = os.getenv("STORAGE_CONN_STRING")
 PARSED_CONTAINER = "parsed"
 BLOB_NAME = "pdf/Criminal Code Act 1899.json"
 

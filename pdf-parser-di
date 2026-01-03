@@ -11,8 +11,8 @@ dotenv.load_dotenv()
 # -------------------------
 # CONFIG
 # -------------------------
-DI_ENDPOINT = "https://congilaw-pdfparser.cognitiveservices.azure.com/"
-DI_KEY = "1tYYhDzLajBOmbyQ80gH0v5JzCvayXwWD1r1bdgH7gF7pcOXP6N7JQQJ99CAACL93NaXJ3w3AAALACOGMFRz"
+DI_ENDPOINT = os.getenv("DI_ENDPOINT")
+DI_KEY = os.getenv("DI_KEY")
 
 STORAGE_CONN_STRING = os.getenv("STORAGE_CONN_STRING")
 RAW_CONTAINER = "raw"
